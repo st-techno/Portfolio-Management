@@ -1,0 +1,152 @@
+## Copyright @ ST Technologies
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from binance.client import Client
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, MultiHeadAttention, LayerNormalization, Conv1D, GlobalAveragePooling1D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import Model
+from datetime import datetime, timedelta
+
+# Binance API configuration
+API_KEY = 'your_api_key'
+API_SECRET = 'your_api_secret'
+client = Client(API_KEY, API_SECRET)
+
+# Model parameters
+SEQ_LENGTH = 60  # 60-day lookback period
+PREDICTION_WINDOW = 1  # Predict next day's price
+CRYPTO_PAIRS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'LTCUSDT']
+
+class TransformerBlock(Model):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super(TransformerBlock, self).__init__()
+        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = Sequential([
+            Dense(ff_dim, activation="relu"),
+            Dense(embed_dim)
+        ])
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.dropout1 = Dropout(rate)
+        self.dropout2 = Dropout(rate)
+
+    def call(self, inputs, training=False):
+        attn_output = self.att(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data)-seq_length-PREDICTION_WINDOW):
+        X.append(data[i:(i+seq_length)])
+        y.append(data[i+seq_length:i+seq_length+PREDICTION_WINDOW])
+    return np.array(X), np.array(y)
+
+def build_lstm_model(input_shape):
+    model = Sequential([
+        LSTM(128, return_sequences=True, input_shape=input_shape),
+        Dropout(0.3),
+        LSTM(64, return_sequences=False),
+        Dense(32, activation='relu'),
+        Dense(PREDICTION_WINDOW)
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), 
+                loss='mean_squared_error')
+    return model
+
+def build_transformer_model(input_shape):
+    inputs = tf.keras.Input(shape=input_shape)
+    x = Conv1D(64, kernel_size=3, activation='relu', padding='same')(inputs)
+    x = TransformerBlock(embed_dim=64, num_heads=4, ff_dim=256)(x)
+    x = GlobalAveragePooling1D()(x)
+    x = Dropout(0.2)(x)
+    outputs = Dense(PREDICTION_WINDOW)(x)
+    
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(optimizer=Adam(learning_rate=0.0001),
+                loss='mean_squared_error')
+    return model
+
+def fetch_and_preprocess_data(pair, start_date, end_date):
+    klines = client.get_historical_klines(
+        pair, Client.KLINE_INTERVAL_1DAY,
+        start_date.strftime('%Y-%m-%d'), 
+        end_date.strftime('%Y-%m-%d')
+    )
+    df = pd.DataFrame(klines, columns=[
+        'timestamp', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base', 'taker_buy_quote', 'ignore'
+    ])
+    df['close'] = df['close'].astype(float)
+    return df[['timestamp', 'close']]
+
+def train_predictive_model(pair, model_type='transformer'):
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=365*2)  # 2 years data
+    
+    data = fetch_and_preprocess_data(pair, start_date, end_date)
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data[['close']])
+    
+    X, y = create_sequences(scaled_data, SEQ_LENGTH)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+    
+    if model_type == 'transformer':
+        model = build_transformer_model((SEQ_LENGTH, 1))
+    else:
+        model = build_lstm_model((SEQ_LENGTH, 1))
+    
+    model.fit(X, y, epochs=50, batch_size=32, validation_split=0.2, verbose=0)
+    return model, scaler
+
+def predict_prices(model, scaler, historical_data):
+    last_sequence = historical_data[-SEQ_LENGTH:].reshape(1, SEQ_LENGTH, 1)
+    predicted_normalized = model.predict(last_sequence)
+    return scaler.inverse_transform(predicted_normalized)[0][0]
+
+# Integrated trading strategy with ML predictions
+def enhanced_trading_strategy(investment=1500000):
+    predictions = {}
+    models = {}
+    
+    for pair in CRYPTO_PAIRS:
+        model, scaler = train_predictive_model(pair, model_type='transformer')
+        data = fetch_and_preprocess_data(pair, 
+            datetime.now() - timedelta(days=SEQ_LENGTH), 
+            datetime.now())
+        scaled_data = scaler.transform(data[['close']])
+        predictions[pair] = predict_prices(model, scaler, scaled_data)
+        models[pair] = (model, scaler)
+    
+    # Portfolio allocation based on predictions
+    total_predicted = sum(predictions.values())
+    allocation = {pair: (pred/total_predicted)*investment for pair, pred in predictions.items()}
+    
+    # Execute trades and calculate P&L (simulated)
+    current_prices = {pair: float(client.get_ticker(symbol=pair)['lastPrice']) 
+                     for pair in CRYPTO_PAIRS}
+    pnl = {pair: (predictions[pair] - current_prices[pair]) * (allocation[pair]/current_prices[pair]) 
+          for pair in CRYPTO_PAIRS}
+    
+    # Visualization
+    plt.figure(figsize=(12,6))
+    plt.bar(pnl.keys(), pnl.values(), color=['green' if v>0 else 'red' for v in pnl.values()])
+    plt.title('Predicted Daily P&L Distribution')
+    plt.xlabel('Cryptocurrency Pairs')
+    plt.ylabel('Projected P&L (USDT)')
+    plt.axhline(0, color='black', linestyle='--')
+    plt.show()
+    
+    return pnl
+
+# Execute strategy
+enhanced_trading_strategy()
+
